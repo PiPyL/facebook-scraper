@@ -44,6 +44,8 @@ from .rate_limiter import AdaptiveRateLimiter
 from .retry_strategy import CircuitBreaker, RetryConfig, retry_with_config
 from .metrics import ScraperMetrics
 from .cookie_manager import CookieManager
+from .checkpoint import CheckpointManager, PostCheckpoint
+from .auto_adjuster import AutoAdjuster
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,8 @@ class FacebookScraper:
         enable_metrics=True,
         cookie_pool=None,
         rate_limit_config=None,
+        enable_checkpoints=False,
+        enable_auto_adjust=True,
     ):
         """
         Initialize FacebookScraper with enhanced features.
@@ -80,6 +84,8 @@ class FacebookScraper:
             enable_metrics: Enable metrics collection
             cookie_pool: List of cookie files for rotation
             rate_limit_config: Custom rate limit configuration
+            enable_checkpoints: Enable checkpoint/resume functionality
+            enable_auto_adjust: Enable automatic parameter adjustment
         """
         if session is None:
             session = HTMLSession()
@@ -126,6 +132,20 @@ class FacebookScraper:
         self.retry_config = RetryConfig(
             max_retries=5, base_delay=2.0, max_delay=30.0, exponential_base=2.0
         )
+
+        # Initialize checkpoint manager
+        if enable_checkpoints:
+            self.checkpoint_manager = CheckpointManager()
+            logger.info("Checkpoint/resume enabled")
+        else:
+            self.checkpoint_manager = None
+
+        # Initialize auto-adjuster
+        if enable_auto_adjust and enable_metrics:
+            self.auto_adjuster = AutoAdjuster(self, adjustment_interval=50)
+            logger.info("Auto-adjustment enabled")
+        else:
+            self.auto_adjuster = None
 
     def set_user_agent(self, user_agent):
         self.session.headers["User-Agent"] = user_agent
@@ -938,6 +958,10 @@ class FacebookScraper:
                 self.metrics.record_success('http_request', duration)
             if self.cookie_manager:
                 self.cookie_manager.mark_cookie_success(self.session.cookies)
+
+            # Auto-adjust parameters if enabled
+            if self.auto_adjuster and self.auto_adjuster.should_adjust():
+                self.auto_adjuster.auto_adjust()
 
             return response
 
