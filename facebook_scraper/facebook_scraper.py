@@ -10,6 +10,7 @@ import demjson3 as demjson
 from urllib.parse import parse_qs, urlparse, unquote
 from datetime import datetime
 import os
+import time
 
 from requests import RequestException
 from requests_html import HTMLSession
@@ -39,6 +40,10 @@ from .page_iterators import (
     iter_hashtag_pages,
 )
 from . import exceptions
+from .rate_limiter import AdaptiveRateLimiter
+from .retry_strategy import CircuitBreaker, RetryConfig, retry_with_config
+from .metrics import ScraperMetrics
+from .cookie_manager import CookieManager
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +61,26 @@ class FacebookScraper:
     }
     have_checked_locale = False
 
-    def __init__(self, session=None, requests_kwargs=None):
+    def __init__(
+        self,
+        session=None,
+        requests_kwargs=None,
+        enable_rate_limiting=True,
+        enable_metrics=True,
+        cookie_pool=None,
+        rate_limit_config=None,
+    ):
+        """
+        Initialize FacebookScraper with enhanced features.
+
+        Args:
+            session: Requests session (optional)
+            requests_kwargs: Additional requests parameters
+            enable_rate_limiting: Enable adaptive rate limiting
+            enable_metrics: Enable metrics collection
+            cookie_pool: List of cookie files for rotation
+            rate_limit_config: Custom rate limit configuration
+        """
         if session is None:
             session = HTMLSession()
             session.headers.update(self.default_headers)
@@ -67,6 +91,41 @@ class FacebookScraper:
         self.session = session
         self.requests_kwargs = requests_kwargs
         self.request_count = 0
+
+        # Initialize rate limiter
+        if enable_rate_limiting:
+            if rate_limit_config:
+                self.rate_limiter = AdaptiveRateLimiter(**rate_limit_config)
+            else:
+                self.rate_limiter = AdaptiveRateLimiter(
+                    min_delay=2.0, max_delay=8.0, adaptive=True
+                )
+            logger.info("Rate limiting enabled")
+        else:
+            self.rate_limiter = None
+
+        # Initialize circuit breaker
+        self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=120)
+
+        # Initialize metrics
+        if enable_metrics:
+            self.metrics = ScraperMetrics()
+            logger.info("Metrics collection enabled")
+        else:
+            self.metrics = None
+
+        # Initialize cookie manager
+        if cookie_pool:
+            self.cookie_manager = CookieManager()
+            self.cookie_manager.load_cookie_pool(cookie_pool)
+            logger.info(f"Cookie manager initialized with {len(cookie_pool)} cookies")
+        else:
+            self.cookie_manager = None
+
+        # Retry configuration
+        self.retry_config = RetryConfig(
+            max_retries=5, base_delay=2.0, max_delay=30.0, exponential_base=2.0
+        )
 
     def set_user_agent(self, user_agent):
         self.session.headers["User-Agent"] = user_agent
@@ -858,94 +917,165 @@ class FacebookScraper:
             self.have_checked_locale = True
 
     def get(self, url, **kwargs):
+        """
+        Enhanced GET method with rate limiting, retry, circuit breaker, and metrics.
+        """
+        start_time = time.time()
+
         try:
-            self.request_count += 1
-            url = str(url)
-            if not url.startswith("http"):
-                url = utils.urljoin(FB_MOBILE_BASE_URL, url)
+            # Apply rate limiting
+            if self.rate_limiter:
+                self.rate_limiter.wait()
 
-            if kwargs.get("post"):
-                kwargs.pop("post")
-                response = self.session.post(url=url, **kwargs)
-            else:
-                response = self.session.get(url=url, **self.requests_kwargs, **kwargs)
-            DEBUG = False
-            if DEBUG:
-                for filename in os.listdir("."):
-                    if filename.endswith(".html") and filename.replace(".html", "") in url:
-                        logger.debug(f"Replacing {url} content with {filename}")
-                        with open(filename) as f:
-                            response.html.html = f.read()
-            response.html.html = response.html.html.replace('<!--', '').replace('-->', '')
-            response.raise_for_status()
-            self.check_locale(response)
+            # Use circuit breaker for the actual request
+            response = self.circuit_breaker.call(self._do_get, url, **kwargs)
 
-            # Special handling for video posts that redirect to /watch/
-            if response.url == "https://m.facebook.com/watch/?ref=watch_permalink":
-                post_url = re.search("\d+", url).group()
-                if post_url:
-                    url = utils.urljoin(
-                        FB_MOBILE_BASE_URL,
-                        f"story.php?story_fbid={post_url}&id=1&m_entstream_source=timeline",
-                    )
-                    post = {"original_request_url": post_url, "post_url": url}
-                    logger.debug(f"Requesting page from: {url}")
-                    response = self.get(url)
-            if "/watch/" in response.url:
-                video_id = parse_qs(urlparse(response.url).query).get("v")[0]
-                url = f"story.php?story_fbid={video_id}&id={video_id}&m_entstream_source=video_home&player_suborigin=entry_point&player_format=permalink"
-                logger.debug(f"Fetching {url}")
+            # Record success
+            duration = time.time() - start_time
+            if self.rate_limiter:
+                self.rate_limiter.record_success()
+            if self.metrics:
+                self.metrics.record_success('http_request', duration)
+            if self.cookie_manager:
+                self.cookie_manager.mark_cookie_success(self.session.cookies)
+
+            return response
+
+        except exceptions.TemporarilyBanned as e:
+            if self.rate_limiter:
+                self.rate_limiter.record_error('temporarily_banned')
+            if self.metrics:
+                self.metrics.record_failure('http_request', 'TemporarilyBanned', str(e))
+            logger.error(f"Temporarily banned: {e}")
+            raise
+
+        except exceptions.LoginRequired as e:
+            if self.metrics:
+                self.metrics.record_failure('http_request', 'LoginRequired', str(e))
+            if self.cookie_manager:
+                # Cookie failed - try rotation
+                self.cookie_manager.mark_cookie_failure(self.session.cookies, 'login_required')
+                logger.warning("Cookie invalid, attempting rotation...")
+                self.rotate_cookies()
+            raise
+
+        except RequestException as e:
+            if self.rate_limiter:
+                self.rate_limiter.record_error('request_error')
+            if self.metrics:
+                self.metrics.record_failure('http_request', type(e).__name__, str(e))
+            logger.error(f"Request failed: {e}")
+            raise
+
+    def _do_get(self, url, **kwargs):
+        """
+        Actual GET implementation (called by circuit breaker).
+        """
+        self.request_count += 1
+        url = str(url)
+        if not url.startswith("http"):
+            url = utils.urljoin(FB_MOBILE_BASE_URL, url)
+
+        if kwargs.get("post"):
+            kwargs.pop("post")
+            response = self.session.post(url=url, **kwargs)
+        else:
+            response = self.session.get(url=url, **self.requests_kwargs, **kwargs)
+
+        DEBUG = False
+        if DEBUG:
+            for filename in os.listdir("."):
+                if filename.endswith(".html") and filename.replace(".html", "") in url:
+                    logger.debug(f"Replacing {url} content with {filename}")
+                    with open(filename) as f:
+                        response.html.html = f.read()
+
+        response.html.html = response.html.html.replace('<!--', '').replace('-->', '')
+        response.raise_for_status()
+        self.check_locale(response)
+
+        # Special handling for video posts that redirect to /watch/
+        if response.url == "https://m.facebook.com/watch/?ref=watch_permalink":
+            post_url = re.search("\d+", url).group()
+            if post_url:
+                url = utils.urljoin(
+                    FB_MOBILE_BASE_URL,
+                    f"story.php?story_fbid={post_url}&id=1&m_entstream_source=timeline",
+                )
+                post = {"original_request_url": post_url, "post_url": url}
+                logger.debug(f"Requesting page from: {url}")
                 response = self.get(url)
 
-            if "cookie/consent-page" in response.url:
-                response = self.submit_form(response)
-            if (
-                response.url.startswith(FB_MOBILE_BASE_URL)
-                and not response.html.find("script", first=True)
-                and "script" not in response.html.html
-                and self.session.cookies.get("noscript") != "1"
+        if "/watch/" in response.url:
+            video_id = parse_qs(urlparse(response.url).query).get("v")[0]
+            url = f"story.php?story_fbid={video_id}&id={video_id}&m_entstream_source=video_home&player_suborigin=entry_point&player_format=permalink"
+            logger.debug(f"Fetching {url}")
+            response = self.get(url)
+
+        if "cookie/consent-page" in response.url:
+            response = self.submit_form(response)
+
+        if (
+            response.url.startswith(FB_MOBILE_BASE_URL)
+            and not response.html.find("script", first=True)
+            and "script" not in response.html.html
+            and self.session.cookies.get("noscript") != "1"
+        ):
+            warnings.warn(
+                f"Facebook served mbasic/noscript content unexpectedly on {response.url}"
+            )
+
+        if response.html.find("h1,h2", containing="Unsupported Browser"):
+            warnings.warn(f"Facebook says 'Unsupported Browser'")
+
+        title = response.html.find("title", first=True)
+        not_found_titles = ["page not found", "content not found"]
+        temp_ban_titles = [
+            "you can't use this feature at the moment",
+            "you can't use this feature right now",
+            "you're temporarily blocked",
+        ]
+
+        if "checkpoint" in response.url:
+            if response.html.find("h1", containing="We suspended your account"):
+                raise exceptions.AccountDisabled("Your Account Has Been Disabled")
+
+        if title:
+            if title.text.lower() in not_found_titles:
+                raise exceptions.NotFound(title.text)
+            elif title.text.lower() == "error":
+                raise exceptions.UnexpectedResponse("Your request couldn't be processed")
+            elif title.text.lower() in temp_ban_titles:
+                raise exceptions.TemporarilyBanned(title.text)
+            elif ">your account has been disabled<" in response.html.html.lower():
+                raise exceptions.AccountDisabled("Your Account Has Been Disabled")
+            elif (
+                ">We saw unusual activity on your account. This may mean that someone has used your account without your knowledge.<"
+                in response.html.html
             ):
-                warnings.warn(
-                    f"Facebook served mbasic/noscript content unexpectedly on {response.url}"
+                raise exceptions.AccountDisabled("Your Account Has Been Locked")
+            elif (
+                title.text == "Log in to Facebook | Facebook"
+                or response.url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "login"))
+                or response.url.startswith(utils.urljoin(FB_W3_BASE_URL, "login"))
+            ):
+                raise exceptions.LoginRequired(
+                    "A login (cookies) is required to see this page"
                 )
-            if response.html.find("h1,h2", containing="Unsupported Browser"):
-                warnings.warn(f"Facebook says 'Unsupported Browser'")
-            title = response.html.find("title", first=True)
-            not_found_titles = ["page not found", "content not found"]
-            temp_ban_titles = [
-                "you can't use this feature at the moment",
-                "you can't use this feature right now",
-                "you’re temporarily blocked",
-            ]
-            if "checkpoint" in response.url:
-                if response.html.find("h1", containing="We suspended your account"):
-                    raise exceptions.AccountDisabled("Your Account Has Been Disabled")
-            if title:
-                if title.text.lower() in not_found_titles:
-                    raise exceptions.NotFound(title.text)
-                elif title.text.lower() == "error":
-                    raise exceptions.UnexpectedResponse("Your request couldn't be processed")
-                elif title.text.lower() in temp_ban_titles:
-                    raise exceptions.TemporarilyBanned(title.text)
-                elif ">your account has been disabled<" in response.html.html.lower():
-                    raise exceptions.AccountDisabled("Your Account Has Been Disabled")
-                elif (
-                    ">We saw unusual activity on your account. This may mean that someone has used your account without your knowledge.<"
-                    in response.html.html
-                ):
-                    raise exceptions.AccountDisabled("Your Account Has Been Locked")
-                elif (
-                    title.text == "Log in to Facebook | Facebook"
-                    or response.url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "login"))
-                    or response.url.startswith(utils.urljoin(FB_W3_BASE_URL, "login"))
-                ):
-                    raise exceptions.LoginRequired(
-                        "A login (cookies) is required to see this page"
-                    )
-            return response
-        except RequestException as ex:
-            logger.exception("Exception while requesting URL: %s\nException: %r", url, ex)
-            raise
+
+        return response
+
+    def rotate_cookies(self):
+        """Rotate to next cookie in pool."""
+        if self.cookie_manager:
+            new_cookies = self.cookie_manager.get_next_cookie(force_rotate=True)
+            if new_cookies:
+                self.session.cookies.update(new_cookies)
+                logger.info("Rotated to next cookie set")
+            else:
+                logger.error("No cookies available for rotation")
+        else:
+            logger.warning("Cookie rotation requested but no cookie manager configured")
 
     def submit_form(self, response, extra_data={}):
         action = response.html.find("form", first=True).attrs.get('action')

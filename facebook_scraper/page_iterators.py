@@ -228,26 +228,85 @@ class PageParser:
 
 
 class GroupPageParser(PageParser):
-    """Class for parsing a single page of a group"""
+    """Enhanced class for parsing group pages with multiple pagination strategies"""
 
-    cursor_regex_3 = re.compile(r'href[=:]"(\/groups\/[^"]+bac=[^"]+)"')  # for Group requests
+    # Multiple regex patterns for different group layouts
+    PAGINATION_PATTERNS = [
+        # Pattern 1: Standard group pagination with bac parameter
+        re.compile(r'href[=:]"(\/groups\/[^"]+bac=[^"]+)"'),
+
+        # Pattern 2: Cursor-based pagination
+        re.compile(r'href[=:]"(\/groups\/[^"]+cursor=[^"]+)"'),
+
+        # Pattern 3: Timeline-based
+        re.compile(r'href[=:]"(\/groups\/[^"]+timeline[^"]+)"'),
+
+        # Pattern 4: General groups URL with query params
+        re.compile(r'"(\/groups\/\d+\/?\?[^"]*)"'),
+
+        # Pattern 5: AJAX load more
+        re.compile(r'data-ajaxify-href="([^"]*\/groups\/[^"]+)"'),
+
+        # Pattern 6: Mobile specific "see more" pattern
+        re.compile(r'm_more_item[^"]+href[=:]"([^"]+groups[^"]+)"'),
+
+        # Pattern 7: Encoded slashes version
+        re.compile(r'"(\\/groups\\/[^"]+(?:bac|cursor)[^"]*)"'),
+    ]
 
     def get_next_page(self) -> Optional[URL]:
+        """Try multiple strategies to find next page URL"""
+
+        # Try parent class methods first (standard pagination)
         next_page = super().get_next_page()
         if next_page:
+            logger.debug("Found next page using parent parser")
             return next_page
 
         assert self.cursor_blob is not None
 
-        match = self.cursor_regex_3.search(self.cursor_blob)
-        if match:
-            value = match.groups()[0]
-            return value.encode('utf-8').decode('unicode_escape').replace('\\/', '/')
+        # Try all pagination patterns
+        for i, pattern in enumerate(self.PAGINATION_PATTERNS):
+            match = pattern.search(self.cursor_blob)
+            if match:
+                url = match.group(1)
 
+                # Decode and normalize URL
+                url = url.encode('utf-8').decode('unicode_escape')
+                url = url.replace('\\/', '/')
+                url = url.replace('&amp;', '&')
+
+                logger.debug(f"Found next page using group pattern {i + 1}: {url[:100]}")
+                return url
+
+        # Strategy: Search for "See More" or "Load More" buttons in HTML
+        if self.html:
+            see_more_links = self.html.find('a[data-sigil*="more"], a:contains("See More"), a:contains("View More")')
+            for link in see_more_links:
+                href = link.attrs.get('href') or link.attrs.get('data-ajaxify-href')
+                if href and 'groups' in href.lower():
+                    logger.debug("Found next page via 'See More' button")
+                    return href
+
+        # Strategy: Look for AJAX triggers in the blob
+        if 'ajaxify' in self.cursor_blob or 'async' in self.cursor_blob:
+            ajax_match = re.search(r'"([^"]*groups[^"]*(?:cursor|bac|page)[^"]*)"', self.cursor_blob)
+            if ajax_match:
+                url = ajax_match.group(1).replace('\\', '')
+                logger.debug("Found next page via AJAX trigger")
+                return url
+
+        logger.warning("Could not find next page URL with any strategy")
         return None
 
     def _parse(self):
-        self._parse_html()
+        """Override to handle both HTML and JSON responses"""
+        if self.response.text.startswith(self.json_prefix):
+            logger.debug("Parsing JSON response for group")
+            self._parse_json()
+        else:
+            logger.debug("Parsing HTML response for group")
+            self._parse_html()
 
 
 class PhotosPageParser(PageParser):
